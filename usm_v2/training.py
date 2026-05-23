@@ -177,7 +177,6 @@ def train_phase1(
         rel_maps.train()
 
         c_scale = burnin.get_curvature_scale(epoch)
-        c_eff = manifold.effective_c(c_scale)
 
         epoch_idx = curriculum.get_epoch_indices(epoch).to(device)
         n_epoch = len(epoch_idx)
@@ -190,8 +189,10 @@ def train_phase1(
         ep_r = all_r_idx[epoch_idx[perm]]
         ep_t = all_t_idx[epoch_idx[perm]]
 
+        with torch.no_grad():
+            c_eff_detached = manifold.effective_c(c_scale)
         all_z = (
-            encoder.project(vocab_bb, c=c_eff).detach()
+            encoder.project(vocab_bb, c=c_eff_detached).detach()
             if epoch > 5 else None
         )
 
@@ -208,6 +209,8 @@ def train_phase1(
             leave=(epoch == cfg.n_epochs_p1 - 1),
         )
         for start in batch_iter:
+            c_eff = manifold.effective_c(c_scale)
+
             h_idx = ep_h[start:start + BS]
             t_idx = ep_t[start:start + BS]
             rels = ep_r[start:start + BS]
@@ -293,7 +296,7 @@ def train_phase1(
         history["loss_cl"].append(epoch_losses["loss_cl"] / nb)
         history["loss_ent"].append(epoch_losses["loss_ent"] / nb)
         history["loss_hier"].append(0.0)
-        history["curvature"].append(c_eff.item())
+        history["curvature"].append(c_eff_detached.item())
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["curriculum_pct"].append(cpct)
 
@@ -301,7 +304,7 @@ def train_phase1(
         print(
             f"[P1 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
-            f"c_eff={c_eff.item():.4f}  "
+            f"c_eff={c_eff_detached.item():.4f}  "
             f"data={n_epoch:,}/{len(triples):,}  "
             f"curriculum={cpct:.0%}  "
             f"({dt:.1f}s)",
@@ -388,8 +391,6 @@ def train_phase2(
         vis_encoder.train()
         encoder.train()
 
-        c_eff = manifold.c
-
         perm = torch.randperm(N, device=device)
         epoch_loss = 0.0
         n_batches = 0
@@ -397,6 +398,8 @@ def train_phase2(
         batch_starts = range(0, N, cfg.p2_batch)
         batch_iter = tqdm(batch_starts, desc=f'P2 E{epoch:02d}', leave=(epoch == cfg.n_epochs_p2 - 1))
         for start in batch_iter:
+            c_eff = manifold.c
+
             idx = perm[start:start + cfg.p2_batch]
             clip_emb = precomp_clip[idx]
             labels = precomp_labels[idx]
@@ -435,13 +438,15 @@ def train_phase2(
         history["loss_total"].append(epoch_loss / nb)
         history["loss_xmodal"].append(0.0)
         history["loss_hier"].append(0.0)
-        history["curvature"].append(c_eff.item())
+        with torch.no_grad():
+            c_val = manifold.c.item()
+        history["curvature"].append(c_val)
 
         dt = time.time() - t0
         print(
             f"[P2 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
-            f"c={c_eff.item():.4f}  "
+            f"c={c_val:.4f}  "
             f"({dt:.1f}s)",
             flush=True,
         )
