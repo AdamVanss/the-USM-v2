@@ -133,11 +133,16 @@ def train_phase1(
     n_cl = cl_bb_src.shape[0] if cl_bb_src is not None else 0
     n_snli = snli_bb_a.shape[0] if snli_bb_a is not None else 0
 
+    # Freeze curvature for first N epochs so projection learns the hyperbolic layout
+    c_freeze = getattr(cfg, 'c_freeze_epochs', 10)
+    if cfg.learnable_curvature and c_freeze > 0:
+        manifold._c_param.requires_grad_(False)
+
     manifold_ids = {id(p) for p in manifold.parameters()}
     manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
 
     model_params = []
-    seen = set(id(p) for p in manifold_params)
+    seen = set(id(p) for p in manifold_params) | manifold_ids
     for p in (
         list(encoder.proj.parameters())
         + ([encoder.mu0] if hasattr(encoder, "mu0") else [])
@@ -145,7 +150,7 @@ def train_phase1(
         + list(rel_maps.parameters())
     ):
         pid = id(p)
-        if pid not in seen and pid not in manifold_ids:
+        if pid not in seen:
             seen.add(pid)
             model_params.append(p)
 
@@ -160,12 +165,15 @@ def train_phase1(
         "L_cl": cfg.w_cl, "L_ent": cfg.w_ent, "L_hier": cfg.w_hier,
     }
 
+    ISA_IDX = REL2IDX.get("IS_A", 0)
+
     e0_idx = curriculum.get_epoch_indices(0)
     e0_batches = len(e0_idx) // cfg.batch_size
     print(
         f'Phase 1 starting: {cfg.n_epochs_p1} epochs | {len(triples):,} triples | '
-        f'batch={cfg.batch_size} | d={cfg.d} | device={device}\n'
+        f'batch={cfg.batch_size} | d={cfg.d} | c_init={manifold.c.item():.4f} | device={device}\n'
         f'  Epoch 0: {len(e0_idx):,} triples (~{e0_batches} batches)\n'
+        f'  Curvature frozen for first {c_freeze} epochs, then learnable\n'
         f'  GPU-native loop: no CPU string ops in hot path',
         flush=True,
     )
@@ -175,6 +183,12 @@ def train_phase1(
         encoder.train()
         comp_op.train()
         rel_maps.train()
+
+        # Unfreeze curvature after warm-up
+        if epoch == c_freeze and cfg.learnable_curvature:
+            manifold._c_param.requires_grad_(True)
+            optimizer.add_param_group({"params": [manifold._c_param], "lr": cfg.c_lr})
+            print(f'  [E{epoch:02d}] Curvature unfrozen (c={manifold.c.item():.4f})', flush=True)
 
         c_scale = burnin.get_curvature_scale(epoch)
 
@@ -257,11 +271,20 @@ def train_phase1(
                     c_eff, delta_c=cfg.delta_contradiction,
                 )
 
+            L_hier_val = z_h.new_zeros(())
+            if c_eff.item() > EPS and weights.get("L_hier", 0) > 0:
+                isa_mask = (rels == ISA_IDX)
+                if isa_mask.sum() > 2:
+                    depth_h = dist0(z_h[isa_mask], c_eff)
+                    depth_t = dist0(z_t[isa_mask], c_eff)
+                    L_hier_val = F.relu(depth_t - depth_h + cfg.margin_hier).mean()
+
             total = (
                 weights["L_rel"] * L_rel_val
                 + weights["L_comp"] * L_comp_val
                 + weights.get("L_cl", 0) * L_cl_val
                 + weights.get("L_ent", 0) * L_ent_val
+                + weights.get("L_hier", 0) * L_hier_val
             )
 
             total.backward()
@@ -281,6 +304,7 @@ def train_phase1(
             epoch_losses["loss_comp"] += L_comp_val.item()
             epoch_losses["loss_cl"] += L_cl_val.item()
             epoch_losses["loss_ent"] += L_ent_val.item()
+            epoch_losses["loss_hier"] += L_hier_val.item()
             n_batches += 1
 
             if n_batches == 1 or n_batches % 25 == 0:
@@ -295,7 +319,7 @@ def train_phase1(
         history["loss_comp"].append(epoch_losses["loss_comp"] / nb)
         history["loss_cl"].append(epoch_losses["loss_cl"] / nb)
         history["loss_ent"].append(epoch_losses["loss_ent"] / nb)
-        history["loss_hier"].append(0.0)
+        history["loss_hier"].append(epoch_losses["loss_hier"] / nb)
         history["curvature"].append(c_eff_detached.item())
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["curriculum_pct"].append(cpct)

@@ -14,10 +14,11 @@ class USMConfig:
     seed: int = 42
 
     # --- Manifold ---
-    c_init: float = 1.0
-    c_min: float = 0.01
+    c_init: float = 0.001
+    c_min: float = 0.0001
     c_max: float = 10.0
-    c_lr: float = 1e-3
+    c_lr: float = 1e-4
+    c_freeze_epochs: int = 10
     learnable_curvature: bool = True
 
     # --- Dimensions ---
@@ -51,8 +52,8 @@ class USMConfig:
     max_snli_pairs: int = 20_000
 
     # --- Gradient control ---
-    burnin_epochs: int = 10
-    transition_epochs: int = 5
+    burnin_epochs: int = 0
+    transition_epochs: int = 0
     use_riemannian_clipping: bool = True
 
     # --- Curriculum ---
