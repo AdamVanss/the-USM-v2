@@ -29,7 +29,7 @@ import geoopt
 from .config import USMConfig
 from .manifold import LearnablePoincareBall, logmap0, expmap0, clamp_to_ball, dist0, EPS
 from .encoders import ConceptEncoder, VisionEncoder
-from .operators import CompositionalOperator, RelationMaps, REL2IDX
+from .operators import CompositionalOperator, RelationMaps, REL2IDX, N_RELATIONS, RELATIONS
 from .losses import loss_cl, loss_rel, loss_entailment, loss_crossmodal, loss_hierarchy
 from .gradient_control import (
     scale_riemannian_grads,
@@ -112,7 +112,7 @@ def train_phase1(
     history = {
         "loss_total": [], "loss_rel": [], "loss_comp": [],
         "loss_cl": [], "loss_ent": [], "loss_hier": [],
-        "curvature": [], "lr": [], "curriculum_pct": [],
+        "curvature": [], "curvature_per_rel": [], "lr": [], "curriculum_pct": [],
     }
 
     # ---- Pre-convert ALL triples to GPU index tensors (once) ----
@@ -136,7 +136,7 @@ def train_phase1(
     # Freeze curvature for first N epochs so projection learns the hyperbolic layout
     c_freeze = getattr(cfg, 'c_freeze_epochs', 10)
     if cfg.learnable_curvature and c_freeze > 0:
-        manifold._c_param.requires_grad_(False)
+        manifold._c_params.requires_grad_(False)
 
     manifold_ids = {id(p) for p in manifold.parameters()}
     manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
@@ -166,15 +166,19 @@ def train_phase1(
     }
 
     ISA_IDX = REL2IDX.get("IS_A", 0)
+    PARTOF_IDX = REL2IDX.get("PART_OF", 2)
 
     e0_idx = curriculum.get_epoch_indices(0)
     e0_batches = len(e0_idx) // cfg.batch_size
+    c_per_rel_str = " ".join(f"{manifold.c_rel(r).item():.4f}" for r in range(N_RELATIONS))
     print(
         f'Phase 1 starting: {cfg.n_epochs_p1} epochs | {len(triples):,} triples | '
-        f'batch={cfg.batch_size} | d={cfg.d} | c_init={manifold.c.item():.4f} | device={device}\n'
+        f'batch={cfg.batch_size} | d={cfg.d} | device={device}\n'
+        f'  Per-relation curvature: [{c_per_rel_str}]\n'
+        f'  Relations: {" ".join(RELATIONS)}\n'
         f'  Epoch 0: {len(e0_idx):,} triples (~{e0_batches} batches)\n'
         f'  Curvature frozen for first {c_freeze} epochs, then learnable\n'
-        f'  GPU-native loop: no CPU string ops in hot path',
+        f'  GPU-native loop + cosine LR schedule',
         flush=True,
     )
 
@@ -184,11 +188,16 @@ def train_phase1(
         comp_op.train()
         rel_maps.train()
 
-        # Unfreeze curvature after warm-up
+        # Unfreeze per-relation curvature after warm-up
         if epoch == c_freeze and cfg.learnable_curvature:
-            manifold._c_param.requires_grad_(True)
-            optimizer.add_param_group({"params": [manifold._c_param], "lr": cfg.c_lr})
-            print(f'  [E{epoch:02d}] Curvature unfrozen (c={manifold.c.item():.4f})', flush=True)
+            manifold._c_params.requires_grad_(True)
+            optimizer.add_param_group({"params": [manifold._c_params], "lr": cfg.c_lr})
+            c_str = " ".join(f"{manifold.c_rel(r).item():.4f}" for r in range(N_RELATIONS))
+            print(f'  [E{epoch:02d}] Curvature unfrozen: [{c_str}]', flush=True)
+
+        # Cosine LR schedule for model params (not manifold params)
+        cos_lr = cfg.lr_p1 * 0.5 * (1 + math.cos(math.pi * epoch / cfg.n_epochs_p1))
+        optimizer.param_groups[0]["lr"] = cos_lr
 
         c_scale = burnin.get_curvature_scale(epoch)
 
@@ -204,9 +213,9 @@ def train_phase1(
         ep_t = all_t_idx[epoch_idx[perm]]
 
         with torch.no_grad():
-            c_eff_detached = manifold.effective_c(c_scale)
+            c_base_detached = manifold.effective_c(c_scale).detach()
         all_z = (
-            encoder.project(vocab_bb, c=c_eff_detached).detach()
+            encoder.project(vocab_bb, c=c_base_detached).detach()
             if epoch > 5 else None
         )
 
@@ -223,31 +232,54 @@ def train_phase1(
             leave=(epoch == cfg.n_epochs_p1 - 1),
         )
         for start in batch_iter:
-            c_eff = manifold.effective_c(c_scale)
+            c_base = manifold.effective_c(c_scale)
 
             h_idx = ep_h[start:start + BS]
             t_idx = ep_t[start:start + BS]
             rels = ep_r[start:start + BS]
 
-            z_h = encoder.project(vocab_bb[h_idx], c=c_eff)
-            z_t = encoder.project(vocab_bb[t_idx], c=c_eff)
-
-            z_pred = rel_maps(z_h, rels, c=c_eff)
+            z_h = encoder.project(vocab_bb[h_idx], c=c_base)
+            z_t = encoder.project(vocab_bb[t_idx], c=c_base)
 
             neg_idx = sample_negatives_gpu(
                 BS, n_vocab, epoch, cfg.n_epochs_p1, device,
                 all_z=all_z,
-                z_pred=z_pred.detach() if epoch > 5 else None,
+                z_pred=None,
                 t_idx=t_idx,
                 hard_neg_max_ratio=cfg.hard_neg_max_ratio,
             )
-            z_neg = encoder.project(vocab_bb[neg_idx], c=c_eff)
+            z_neg = encoder.project(vocab_bb[neg_idx], c=c_base)
 
-            L_rel_val = loss_rel(z_pred, z_t, z_neg, c_eff, margin=cfg.margin_rel)
+            # --- Per-relation loss: each relation uses its own curvature ---
+            L_rel_val = z_h.new_zeros(())
+            L_hier_val = z_h.new_zeros(())
+            rel_count = 0
+            hier_count = 0
+            for r in range(N_RELATIONS):
+                mask = (rels == r)
+                n_r = mask.sum().item()
+                if n_r < 2:
+                    continue
+                c_r = manifold.effective_c_rel(r, c_scale)
+                z_pred_r = rel_maps(z_h[mask], rels[mask], c=c_r)
+                L_r = loss_rel(z_pred_r, z_t[mask], z_neg[mask], c_r, margin=cfg.margin_rel)
+                L_rel_val = L_rel_val + L_r * n_r
+                rel_count += n_r
 
-            z_comp = comp_op(z_h, rels, z_t, c=c_eff)
-            if c_eff.item() > EPS:
-                L_comp_val = logmap0(z_comp, c_eff).pow(2).mean()
+                if r in (ISA_IDX, PARTOF_IDX) and c_r.item() > EPS and weights.get("L_hier", 0) > 0:
+                    depth_h_r = dist0(z_h[mask], c_r)
+                    depth_t_r = dist0(z_t[mask], c_r)
+                    L_hier_val = L_hier_val + F.relu(depth_t_r - depth_h_r + cfg.margin_hier).mean() * n_r
+                    hier_count += n_r
+
+            if rel_count > 0:
+                L_rel_val = L_rel_val / rel_count
+            if hier_count > 0:
+                L_hier_val = L_hier_val / hier_count
+
+            z_comp = comp_op(z_h, rels, z_t, c=c_base)
+            if c_base.item() > EPS:
+                L_comp_val = logmap0(z_comp, c_base).pow(2).mean()
             else:
                 L_comp_val = z_comp.pow(2).mean()
 
@@ -255,29 +287,21 @@ def train_phase1(
             if n_cl > 0 and weights.get("L_cl", 0) > 0:
                 n_cl_batch = min(BS // 2, n_cl)
                 idx_cl = torch.randint(0, n_cl, (n_cl_batch,), device=device)
-                z_src = encoder.project(cl_bb_src[idx_cl], c=c_eff)
-                z_tgt = encoder.project(cl_bb_tgt[idx_cl], c=c_eff)
-                L_cl_val = loss_cl(z_src, z_tgt, c_eff)
+                z_src = encoder.project(cl_bb_src[idx_cl], c=c_base)
+                z_tgt = encoder.project(cl_bb_tgt[idx_cl], c=c_base)
+                L_cl_val = loss_cl(z_src, z_tgt, c_base)
 
             L_ent_val = z_h.new_zeros(())
             if n_snli > 0 and weights.get("L_ent", 0) > 0:
                 n_ent_batch = min(BS // 2, n_snli)
                 idx_sn = torch.randint(0, n_snli, (n_ent_batch,), device=device)
-                z_a_ent = encoder.project(snli_bb_a[idx_sn], c=c_eff)
-                z_b_ent = encoder.project(snli_bb_b[idx_sn], c=c_eff)
+                z_a_ent = encoder.project(snli_bb_a[idx_sn], c=c_base)
+                z_b_ent = encoder.project(snli_bb_b[idx_sn], c=c_base)
                 L_ent_val = loss_entailment(
                     z_a_ent, z_b_ent,
                     snli_labels_t[idx_sn],
-                    c_eff, delta_c=cfg.delta_contradiction,
+                    c_base, delta_c=cfg.delta_contradiction,
                 )
-
-            L_hier_val = z_h.new_zeros(())
-            if c_eff.item() > EPS and weights.get("L_hier", 0) > 0:
-                isa_mask = (rels == ISA_IDX)
-                if isa_mask.sum() > 2:
-                    depth_h = dist0(z_h[isa_mask], c_eff)
-                    depth_t = dist0(z_t[isa_mask], c_eff)
-                    L_hier_val = F.relu(depth_t - depth_h + cfg.margin_hier).mean()
 
             total = (
                 weights["L_rel"] * L_rel_val
@@ -289,10 +313,10 @@ def train_phase1(
 
             total.backward()
 
-            if c_eff.item() > EPS and cfg.use_riemannian_clipping:
+            if c_base.item() > EPS and cfg.use_riemannian_clipping:
                 manifold_aware = [p for p in model_params if p.grad is not None]
-                scale_riemannian_grads(manifold_aware, c_eff)
-                clip_riemannian_grad_norm(manifold_aware, cfg.grad_clip_norm, c_eff)
+                scale_riemannian_grads(manifold_aware, c_base)
+                clip_riemannian_grad_norm(manifold_aware, cfg.grad_clip_norm, c_base)
             else:
                 torch.nn.utils.clip_grad_norm_(model_params, cfg.grad_clip_norm)
 
@@ -310,7 +334,7 @@ def train_phase1(
             if n_batches == 1 or n_batches % 25 == 0:
                 batch_iter.set_postfix(
                     loss=f'{total.item():.3f}',
-                    c_eff=f'{c_eff.item():.3f}',
+                    c_base=f'{c_base.item():.3f}',
                 )
 
         nb = max(n_batches, 1)
@@ -320,15 +344,20 @@ def train_phase1(
         history["loss_cl"].append(epoch_losses["loss_cl"] / nb)
         history["loss_ent"].append(epoch_losses["loss_ent"] / nb)
         history["loss_hier"].append(epoch_losses["loss_hier"] / nb)
-        history["curvature"].append(c_eff_detached.item())
+        history["curvature"].append(c_base_detached.item())
+        with torch.no_grad():
+            c_per_rel = [manifold.c_rel(r).item() for r in range(N_RELATIONS)]
+        history["curvature_per_rel"].append(c_per_rel)
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["curriculum_pct"].append(cpct)
 
         dt = time.time() - t0
+        c_rel_str = " ".join(f"{v:.4f}" for v in c_per_rel)
         print(
             f"[P1 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
-            f"c_eff={c_eff_detached.item():.4f}  "
+            f"c=[{c_rel_str}]  "
+            f"lr={cos_lr:.1e}  "
             f"data={n_epoch:,}/{len(triples):,}  "
             f"curriculum={cpct:.0%}  "
             f"({dt:.1f}s)",

@@ -32,6 +32,7 @@ class USMConfig:
 
     # --- Relations ---
     relations: tuple = ("IS_A", "CAUSES", "PART_OF", "SIMILAR_TO", "ANTONYM", "CAPABLE_OF")
+    n_relations: int = 6
 
     # --- Training Phase 1 ---
     n_epochs_p1: int = 60

@@ -23,15 +23,14 @@ def evaluate_link_prediction(
     concept2bb: Dict[str, int],
     c: torch.Tensor,
     hyperbolic: bool = True,
+    manifold=None,
     tag: str = "",
     max_eval: int = 2000,
     device: torch.device = torch.device("cpu"),
 ) -> Dict[str, float]:
-    """KG link prediction on held-out ConceptNet triples."""
+    """KG link prediction with per-relation curvature when manifold is provided."""
     encoder.eval()
     rel_maps.eval()
-
-    cdist_fn = poincare_cdist if (hyperbolic and c.item() > EPS) else eucl_cdist
 
     all_z = []
     with torch.no_grad():
@@ -49,15 +48,18 @@ def evaluate_link_prediction(
     for h, r, t in tqdm(test_triples[:max_eval], desc=f"LinkPred {tag}", leave=False):
         if h not in concept2idx or t not in concept2idx:
             continue
-        r_idx = torch.tensor([REL2IDX[r]], device=device)
-        z_h = all_z[concept2idx[h]].unsqueeze(0)
+        r_idx_val = REL2IDX[r]
+        r_idx = torch.tensor([r_idx_val], device=device)
 
+        c_r = manifold.c_rel(r_idx_val) if (manifold is not None and hyperbolic) else c
+
+        z_h = all_z[concept2idx[h]].unsqueeze(0)
         with torch.no_grad():
-            z_pred = rel_maps(z_h, r_idx, c=c)
-            if hyperbolic and c.item() > EPS:
-                dists = cdist_fn(z_pred, all_z, c).squeeze(0)
+            z_pred = rel_maps(z_h, r_idx, c=c_r)
+            if hyperbolic and c_r.item() > EPS:
+                dists = poincare_cdist(z_pred, all_z, c_r).squeeze(0)
             else:
-                dists = cdist_fn(z_pred, all_z).squeeze(0)
+                dists = eucl_cdist(z_pred, all_z).squeeze(0)
         rank = (dists < dists[concept2idx[t]]).sum().item() + 1
         ranks.append(rank)
 

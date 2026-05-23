@@ -15,36 +15,45 @@ EPS = 1e-5
 
 class LearnablePoincareBall(nn.Module):
     """
-    Poincaré ball with a learnable (or fixed) curvature parameter.
+    Poincaré ball with per-relation learnable curvature.
 
-    In the Poincaré ball model with curvature -c (c > 0), points live inside the
-    open ball of radius 1/sqrt(c). The conformal factor at point x is:
-        lambda_x = 2 / (1 - c * ||x||^2)
-
-    Making c learnable lets the model find the right amount of hyperbolicity
-    for the data, and setting c_effective = c * scale allows a smooth burn-in
-    from Euclidean (scale=0) to full hyperbolic (scale=1).
+    Each relation type gets its own curvature c_r. The base curvature
+    (used for projection) is max(c_r) so all points fit in every
+    relation-specific ball. This lets IS_A develop strong curvature for
+    tree structure while SIMILAR_TO stays near-Euclidean.
     """
 
-    def __init__(self, c_init: float = 1.0, c_min: float = 0.01, c_max: float = 10.0,
-                 learnable: bool = True):
+    def __init__(self, c_init: float = 0.001, c_min: float = 0.0001, c_max: float = 10.0,
+                 learnable: bool = True, n_relations: int = 6):
         super().__init__()
         self.c_min = c_min
         self.c_max = c_max
+        self.n_relations = n_relations
         if learnable:
-            self._c_param = nn.Parameter(torch.tensor(float(c_init)))
+            self._c_params = nn.Parameter(torch.full((n_relations,), float(c_init)))
         else:
-            self.register_buffer("_c_param", torch.tensor(float(c_init)))
+            self.register_buffer("_c_params", torch.full((n_relations,), float(c_init)))
 
     @property
     def c(self) -> torch.Tensor:
-        return torch.clamp(self._c_param, self.c_min, self.c_max)
+        """Base curvature for projection (max over all relations)."""
+        return torch.clamp(self._c_params.max(), self.c_min, self.c_max)
+
+    def c_rel(self, rel_idx: int) -> torch.Tensor:
+        """Curvature for a specific relation index (scalar)."""
+        return torch.clamp(self._c_params[rel_idx], self.c_min, self.c_max)
 
     def effective_c(self, scale: float = 1.0) -> torch.Tensor:
-        """Curvature modulated by burn-in scale in [0, 1]."""
+        """Base curvature modulated by burn-in scale in [0, 1]."""
         if scale <= 0.0:
-            return torch.tensor(0.0, device=self._c_param.device)
+            return torch.tensor(0.0, device=self._c_params.device)
         return self.c * scale
+
+    def effective_c_rel(self, rel_idx: int, scale: float = 1.0) -> torch.Tensor:
+        """Per-relation curvature modulated by burn-in scale."""
+        if scale <= 0.0:
+            return torch.tensor(0.0, device=self._c_params.device)
+        return self.c_rel(rel_idx) * scale
 
     @property
     def ball(self) -> geoopt.PoincareBall:
