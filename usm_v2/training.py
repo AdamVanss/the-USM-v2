@@ -131,14 +131,21 @@ def train_phase1(
     loss_scheduler = LossWeightScheduler(cfg.n_epochs_p1, enabled=cfg.curriculum_enabled)
     burnin = BurninScheduler(cfg.burnin_epochs, cfg.transition_epochs)
 
-    manifold_params = list(filter(lambda p: p.requires_grad, [manifold._c_param] if cfg.learnable_curvature else []))
-    model_params = (
+    manifold_ids = {id(p) for p in manifold.parameters()}
+    manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
+
+    model_params = []
+    seen = set(id(p) for p in manifold_params)
+    for p in (
         list(encoder.proj.parameters())
+        + ([encoder.mu0] if hasattr(encoder, "mu0") else [])
         + list(comp_op.parameters())
         + list(rel_maps.parameters())
-    )
-    if hasattr(encoder, "mu0"):
-        model_params.append(encoder.mu0)
+    ):
+        pid = id(p)
+        if pid not in seen and pid not in manifold_ids:
+            seen.add(pid)
+            model_params.append(p)
 
     param_groups = [
         {"params": model_params, "lr": cfg.lr_p1},
@@ -361,15 +368,21 @@ def train_phase2(
         "curvature": [],
     }
 
-    vis_params = list(vis_encoder.proj.parameters())
-    if hasattr(vis_encoder, "mu0"):
-        vis_params.append(vis_encoder.mu0)
+    manifold_ids = {id(p) for p in manifold.parameters()}
+    manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
 
-    text_params = list(encoder.proj.parameters())
-    if hasattr(encoder, "mu0"):
-        text_params.append(encoder.mu0)
+    seen = set(id(p) for p in manifold_params) | manifold_ids
+    vis_params = []
+    for p in list(vis_encoder.proj.parameters()) + ([vis_encoder.mu0] if hasattr(vis_encoder, "mu0") else []):
+        if id(p) not in seen:
+            seen.add(id(p))
+            vis_params.append(p)
 
-    manifold_params = list(filter(lambda p: p.requires_grad, [manifold._c_param] if cfg.learnable_curvature else []))
+    text_params = []
+    for p in list(encoder.proj.parameters()) + ([encoder.mu0] if hasattr(encoder, "mu0") else []):
+        if id(p) not in seen:
+            seen.add(id(p))
+            text_params.append(p)
 
     param_groups = [
         {"params": vis_params, "lr": cfg.lr_p2_vis},
