@@ -49,6 +49,14 @@ class ConceptEncoder(nn.Module):
                 manifold=geoopt.PoincareBall(c=1.0),
             )
 
+    def to(self, *args, **kwargs):
+        """Move trainable layers but keep frozen backbone on backbone_device."""
+        super().to(*args, **kwargs)
+        if hasattr(self, 'proj') and len(list(self.proj.parameters())) > 0:
+            self.device = next(self.proj.parameters()).device
+        self.backbone.to(self.backbone_device)
+        return self
+
     @torch.no_grad()
     def encode_backbone(self, texts: List[str]) -> torch.Tensor:
         embs = self.backbone.encode(texts, convert_to_tensor=True, show_progress_bar=False)
@@ -113,6 +121,14 @@ class VisionEncoder(nn.Module):
                 torch.zeros(d_out),
                 manifold=geoopt.PoincareBall(c=1.0),
             )
+
+    def to(self, *args, **kwargs):
+        """Move trainable layers but keep frozen CLIP on backbone_device."""
+        super().to(*args, **kwargs)
+        if hasattr(self, 'proj') and len(list(self.proj.parameters())) > 0:
+            self.device = next(self.proj.parameters()).device
+        self.clip.to(self.backbone_device)
+        return self
 
     @torch.no_grad()
     def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
