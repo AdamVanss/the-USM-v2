@@ -85,28 +85,56 @@ class USMConfig:
 
     # --- Computed at runtime ---
     device: Optional[torch.device] = field(default=None, repr=False)
+    backbone_device: Optional[torch.device] = field(default=None, repr=False)
     use_bf16: bool = False
     large_gpu: bool = False
+    n_gpus: int = 1
 
     def __post_init__(self):
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if torch.cuda.is_available():
+            self.n_gpus = torch.cuda.device_count()
             vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             self.large_gpu = vram_gb >= 24
             self.use_bf16 = vram_gb >= 38
         else:
+            self.n_gpus = 0
             self.large_gpu = False
             self.use_bf16 = False
 
+        if self.backbone_device is None:
+            if self.n_gpus >= 2:
+                self.backbone_device = torch.device("cuda:1")
+            else:
+                self.backbone_device = self.device
+
         if self.validation_mode:
             self.apply_validation_scale()
+        elif self.n_gpus >= 2 and not self.large_gpu:
+            self._apply_dual_t4_scale()
         elif not self.large_gpu:
             self._apply_medium_scale()
 
+    def _apply_dual_t4_scale(self):
+        """Optimized for Kaggle T4 x2: backbone on GPU 1, training on GPU 0."""
+        self.d = 512
+        self.d_clip = 512
+        self.clip_model = "openai/clip-vit-base-patch32"
+        self.n_epochs_p1 = 30
+        self.n_epochs_p2 = 30
+        self.batch_size = 256
+        self.p2_batch = 2048
+        self.max_cn_triples = 200_000
+        self.max_cl_per_lang = 20_000
+        self.max_snli_pairs = 20_000
+        self.max_clip_images = 50_000
+        self.encode_batch = 512
+        self.grad_accum = 1
+
     def _apply_medium_scale(self):
-        """Downscale for T4 / consumer GPU (12-16 GB)."""
+        """Downscale for single T4 / consumer GPU (12-16 GB)."""
         self.d = 512
         self.d_clip = 512
         self.clip_model = "openai/clip-vit-base-patch32"
