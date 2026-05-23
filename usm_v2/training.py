@@ -98,12 +98,22 @@ def train_phase1(
     vocab_list: List[str],
     vocab_bb: torch.Tensor,
     concept2bb: Dict[str, int],
+    # Pre-cached backbone tensors — if provided, encode_backbone is never called
+    # inside the batch loop (huge speedup on T4 and similar GPUs)
+    cl_bb_src: Optional[torch.Tensor] = None,
+    cl_bb_tgt: Optional[torch.Tensor] = None,
+    snli_bb_a: Optional[torch.Tensor] = None,
+    snli_bb_b: Optional[torch.Tensor] = None,
+    snli_labels_t: Optional[torch.Tensor] = None,
 ) -> Dict[str, List]:
     """
     Phase 1 training loop with all three enhancements:
       - Learnable curvature (burn-in → full)
       - Riemannian gradient control (scaling + clipping)
       - Curriculum (progressive data, loss scheduling, hard negatives)
+
+    Pass pre-cached backbone tensors (cl_bb_src/tgt, snli_bb_a/b, snli_labels_t)
+    to avoid running the backbone encoder inside the hot batch loop.
     """
     device = cfg.device
     history = {
@@ -145,6 +155,16 @@ def train_phase1(
 
     vocab2idx = {c: i for i, c in enumerate(vocab_list)}
 
+    e0_triples = curriculum.get_epoch_triples(0)
+    e0_batches = len(e0_triples) // cfg.batch_size
+    print(
+        f'Phase 1 starting: {cfg.n_epochs_p1} epochs | {len(triples):,} triples | '
+        f'batch={cfg.batch_size} | d={cfg.d} | device={device}\n'
+        f'  Epoch 0: {len(e0_triples):,} triples (~{e0_batches} batches) — '
+        f'first summary line appears after epoch 0 finishes',
+        flush=True,
+    )
+
     for epoch in range(cfg.n_epochs_p1):
         t0 = time.time()
         encoder.train()
@@ -164,11 +184,21 @@ def train_phase1(
             collate_fn=kg_collate_fn, drop_last=True,
         )
 
+        all_z = (
+            encoder.project(vocab_bb, c=c_eff).detach()
+            if epoch > 5 else None
+        )
+
         epoch_loss = 0.0
         epoch_losses = {k: 0.0 for k in history if k.startswith("loss_")}
         n_batches = 0
 
-        for heads, rels, tails in kg_dl:
+        batch_iter = tqdm(
+            kg_dl,
+            desc=f'P1 E{epoch:02d}',
+            leave=(epoch == cfg.n_epochs_p1 - 1),
+        )
+        for heads, rels, tails in batch_iter:
             h_idx = torch.tensor([concept2bb[h] for h in heads], device=device)
             t_idx = torch.tensor([concept2bb[t] for t in tails], device=device)
 
@@ -180,7 +210,7 @@ def train_phase1(
 
             neg_tails = sample_negatives(
                 z_h.shape[0], vocab_list, epoch, cfg.n_epochs_p1,
-                all_z=encoder.project(vocab_bb, c=c_eff).detach() if epoch > 5 else None,
+                all_z=all_z,
                 z_pred=z_pred.detach() if epoch > 5 else None,
                 vocab2idx=vocab2idx,
                 exclude_idx=[vocab2idx.get(t) for t in tails],
@@ -200,10 +230,15 @@ def train_phase1(
             L_cl_val = z_h.new_zeros(())
             if cl_pairs and weights.get("L_cl", 0) > 0:
                 n_cl = min(cfg.batch_size // 2, len(cl_pairs))
-                cl_batch = random.sample(cl_pairs, n_cl)
-                src_texts, tgt_texts = zip(*cl_batch)
-                src_bb = encoder.encode_backbone(list(src_texts))
-                tgt_bb = encoder.encode_backbone(list(tgt_texts))
+                if cl_bb_src is not None and cl_bb_tgt is not None:
+                    idx_cl = torch.randint(0, cl_bb_src.shape[0], (n_cl,))
+                    src_bb = cl_bb_src[idx_cl]
+                    tgt_bb = cl_bb_tgt[idx_cl]
+                else:
+                    cl_batch = random.sample(cl_pairs, n_cl)
+                    src_texts, tgt_texts = zip(*cl_batch)
+                    src_bb = encoder.encode_backbone(list(src_texts))
+                    tgt_bb = encoder.encode_backbone(list(tgt_texts))
                 z_src = encoder.project(src_bb, c=c_eff)
                 z_tgt = encoder.project(tgt_bb, c=c_eff)
                 L_cl_val = loss_cl(z_src, z_tgt, c_eff)
@@ -211,15 +246,22 @@ def train_phase1(
             L_ent_val = z_h.new_zeros(())
             if snli_pairs and weights.get("L_ent", 0) > 0:
                 n_ent = min(cfg.batch_size // 2, len(snli_pairs))
-                ent_batch = random.sample(snli_pairs, n_ent)
-                sa, sb, slabels = zip(*ent_batch)
-                za_bb = encoder.encode_backbone(list(sa))
-                zb_bb = encoder.encode_backbone(list(sb))
+                if snli_bb_a is not None and snli_bb_b is not None and snli_labels_t is not None:
+                    idx_sn = torch.randint(0, snli_bb_a.shape[0], (n_ent,))
+                    za_bb = snli_bb_a[idx_sn]
+                    zb_bb = snli_bb_b[idx_sn]
+                    sn_labels = snli_labels_t[idx_sn].to(device)
+                else:
+                    ent_batch = random.sample(snli_pairs, n_ent)
+                    sa, sb, slabels = zip(*ent_batch)
+                    za_bb = encoder.encode_backbone(list(sa))
+                    zb_bb = encoder.encode_backbone(list(sb))
+                    sn_labels = torch.tensor(slabels, device=device)
                 z_a_ent = encoder.project(za_bb, c=c_eff)
                 z_b_ent = encoder.project(zb_bb, c=c_eff)
                 L_ent_val = loss_entailment(
                     z_a_ent, z_b_ent,
-                    torch.tensor(slabels, device=device),
+                    sn_labels,
                     c_eff, delta_c=cfg.delta_contradiction,
                 )
 
@@ -249,6 +291,12 @@ def train_phase1(
             epoch_losses["loss_ent"] += L_ent_val.item()
             n_batches += 1
 
+            if n_batches == 1 or n_batches % 25 == 0:
+                batch_iter.set_postfix(
+                    loss=f'{total.item():.3f}',
+                    c_eff=f'{c_eff.item():.3f}',
+                )
+
         nb = max(n_batches, 1)
         history["loss_total"].append(epoch_loss / nb)
         history["loss_rel"].append(epoch_losses["loss_rel"] / nb)
@@ -267,7 +315,8 @@ def train_phase1(
             f"c_eff={c_eff.item():.4f}  "
             f"data={len(epoch_triples):,}/{len(triples):,}  "
             f"curriculum={cpct:.0%}  "
-            f"({dt:.1f}s)"
+            f"({dt:.1f}s)",
+            flush=True,
         )
 
         if cfg.ckpt_dir and (epoch + 1) % cfg.ckpt_every == 0:
@@ -332,6 +381,12 @@ def train_phase2(
     optimizer = geoopt.optim.RiemannianAdam(param_groups, weight_decay=cfg.weight_decay)
 
     N = precomp_clip.shape[0]
+    p2_batches = (N + cfg.p2_batch - 1) // cfg.p2_batch
+    print(
+        f'Phase 2 starting: {cfg.n_epochs_p2} epochs | {N:,} images | '
+        f'batch={cfg.p2_batch} (~{p2_batches} batches/epoch) | device={device}',
+        flush=True,
+    )
 
     for epoch in range(cfg.n_epochs_p2):
         t0 = time.time()
@@ -344,7 +399,9 @@ def train_phase2(
         epoch_loss = 0.0
         n_batches = 0
 
-        for start in range(0, N, cfg.p2_batch):
+        batch_starts = range(0, N, cfg.p2_batch)
+        batch_iter = tqdm(batch_starts, desc=f'P2 E{epoch:02d}', leave=(epoch == cfg.n_epochs_p2 - 1))
+        for start in batch_iter:
             idx = perm[start:start + cfg.p2_batch]
             clip_emb = precomp_clip[idx]
             labels = precomp_labels[idx]
@@ -376,6 +433,9 @@ def train_phase2(
             epoch_loss += total.item()
             n_batches += 1
 
+            if n_batches == 1 or n_batches % 10 == 0:
+                batch_iter.set_postfix(loss=f'{total.item():.3f}')
+
         nb = max(n_batches, 1)
         history["loss_total"].append(epoch_loss / nb)
         history["loss_xmodal"].append(0.0)
@@ -387,7 +447,8 @@ def train_phase2(
             f"[P2 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
             f"c={c_eff.item():.4f}  "
-            f"({dt:.1f}s)"
+            f"({dt:.1f}s)",
+            flush=True,
         )
 
         if cfg.ckpt_dir and (epoch + 1) % cfg.ckpt_every == 0:
