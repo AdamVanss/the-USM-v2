@@ -150,7 +150,7 @@ class USMConfig:
         self.d = 256
         self.d_clip = 256
         self.clip_model = "openai/clip-vit-base-patch32"
-        self.n_epochs_p1 = 3
+        self.n_epochs_p1 = 5
         self.n_epochs_p2 = 2
         self.batch_size = 64
         self.p2_batch = 256
@@ -159,7 +159,7 @@ class USMConfig:
         self.max_snli_pairs = 300
         self.max_clip_images = 4_000
         self.encode_batch = 128
-        self.burnin_epochs = 2
+        self.burnin_epochs = 1
         self.transition_epochs = 1
         self.curriculum_enabled = False
         self.ckpt_every = 999
