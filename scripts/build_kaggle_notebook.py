@@ -79,14 +79,15 @@ import geoopt
 
     cells = [
         cell_md(
-            "# Universal Semantic Manifold — v2 (Single Notebook)\n\n"
-            "Self-contained notebook for **Kaggle** (no repo clone needed).\n\n"
+            "# Universal Semantic Manifold — v2 (Full Training)\n\n"
+            "Self-contained notebook for **Kaggle T4 x2** — full-scale training run.\n\n"
             "**Before running:**\n"
-            "1. **Settings → Accelerator → GPU** (T4 or P100)\n"
-            "2. **Settings → Internet → ON** (downloads ConceptNet, SNLI, models)\n"
-            "3. Keep `VALIDATION_MODE = True` for a ~5–10 min smoke test\n\n"
+            "1. **Settings → Accelerator → GPU T4 x2**\n"
+            "2. **Settings → Internet → ON** (downloads ConceptNet, SNLI, models)\n\n"
+            "Auto-detects dual-T4 and places frozen backbones on GPU 1, training on GPU 0.\n\n"
             "Pipeline: learnable Poincaré curvature · Riemannian gradient control · "
-            "curriculum training · cross-modal alignment."
+            "curriculum training · cross-modal alignment.\n\n"
+            "**Estimated time:** ~1.5–2 hours on T4 x2."
         ),
         cell_code(
             "!pip install -q geoopt sentence-transformers transformers datasets umap-learn torchvision\n"
@@ -96,7 +97,7 @@ import geoopt
         cell_code(library_code),
         cell_md("## Configuration"),
         cell_code(
-            "VALIDATION_MODE = True  # False = full training scale\n\n"
+            "VALIDATION_MODE = False  # True = quick smoke test, False = full training\n\n"
             "CKPT_DIR = '/kaggle/working/checkpoints'\n"
             "DATA_ROOT = '/kaggle/working/data'\n"
             "os.makedirs(CKPT_DIR, exist_ok=True)\n"
@@ -109,15 +110,20 @@ import geoopt
             "mode = 'VALIDATION (smoke test)' if cfg.validation_mode else 'TRAINING (full scale)'\n"
             "print(f'Mode:              {mode}')\n"
             "print(f'Dimension:         {cfg.d}')\n"
+            "print(f'Batch size:        {cfg.batch_size} (P1)  |  {cfg.p2_batch} (P2)')\n"
             "print(f'P1 epochs:         {cfg.n_epochs_p1}  |  P2 epochs: {cfg.n_epochs_p2}')\n"
             "print(f'ConceptNet cap:    {cfg.max_cn_triples:,} triples')\n"
-            "print(f'Device:            {cfg.device}')\n"
+            "print(f'CL cap:            {cfg.max_cl_per_lang:,} per lang')\n"
+            "print(f'SNLI cap:          {cfg.max_snli_pairs:,} pairs')\n"
+            "print(f'CLIP images cap:   {cfg.max_clip_images:,}')\n"
+            "print(f'Burn-in:           {cfg.burnin_epochs} epochs + {cfg.transition_epochs} transition')\n"
+            "print(f'Curriculum:        {cfg.curriculum_enabled}')\n"
             "print(f'GPUs:              {cfg.n_gpus}')\n"
-            "print(f'Large GPU:         {cfg.large_gpu}')\n"
             "if torch.cuda.is_available():\n"
             "    for i in range(cfg.n_gpus):\n"
+            "        props = torch.cuda.get_device_properties(i)\n"
             "        print(f'  GPU {i}: {torch.cuda.get_device_name(i)} '\n"
-            "              f'({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)')\n"
+            "              f'({props.total_memory / 1e9:.1f} GB)')\n"
             "print(f'Training device:   {cfg.device}')\n"
             "print(f'Backbone device:   {cfg.backbone_device}')"
         ),
@@ -143,7 +149,12 @@ import geoopt
             "    *comp_op.parameters(), *rel_maps.parameters(),\n"
             "] if p.requires_grad)\n"
             "print(f'Trainable parameters: {n_params:,}')\n"
-            "print(f'Initial curvature c = {manifold.c.item():.4f}')"
+            "print(f'Initial curvature c = {manifold.c.item():.4f}')\n\n"
+            "if torch.cuda.is_available():\n"
+            "    for i in range(cfg.n_gpus):\n"
+            "        alloc = torch.cuda.memory_allocated(i) / 1e9\n"
+            "        total = torch.cuda.get_device_properties(i).total_memory / 1e9\n"
+            "        print(f'  GPU {i} VRAM: {alloc:.2f} / {total:.1f} GB ({alloc/total:.0%})')"
         ),
         cell_md("## 2. Load Data"),
         cell_code(
@@ -168,6 +179,8 @@ import geoopt
         ),
         cell_md("## 3. Pre-cache Embeddings"),
         cell_code(
+            "import time as _time\n"
+            "_run_start = _time.time()\n\n"
             "vocab_bb = _precache_text_embeddings(encoder, vocab_list, batch_size=cfg.encode_batch, device=cfg.device)\n"
             "print(f'Vocab backbone cache: {vocab_bb.shape}')\n\n"
             "print('Pre-caching cross-lingual pairs...')\n"
@@ -197,10 +210,18 @@ import geoopt
             "n_test = max(500, len(triples) // 20)\n"
             "test_triples = triples[:n_test]\n"
             "train_triples = triples[n_test:]\n"
-            "print(f'Train triples: {len(train_triples):,}  |  Test triples: {len(test_triples):,}')"
+            "print(f'Train triples: {len(train_triples):,}  |  Test triples: {len(test_triples):,}')\n\n"
+            "if torch.cuda.is_available():\n"
+            "    print('\\nVRAM after pre-caching:')\n"
+            "    for i in range(cfg.n_gpus):\n"
+            "        alloc = torch.cuda.memory_allocated(i) / 1e9\n"
+            "        total = torch.cuda.get_device_properties(i).total_memory / 1e9\n"
+            "        print(f'  GPU {i}: {alloc:.2f} / {total:.1f} GB ({alloc/total:.0%})')\n"
+            "print(f'Pre-cache time: {_time.time() - _run_start:.1f}s')"
         ),
         cell_md("## 4. Phase 1 — Text-only Training"),
         cell_code(
+            "_p1_start = _time.time()\n"
             "history_p1 = train_phase1(\n"
             "    cfg, manifold, encoder, comp_op, rel_maps,\n"
             "    train_triples, cl_pairs, snli_pairs,\n"
@@ -208,7 +229,11 @@ import geoopt
             "    cl_bb_src=cl_bb_src, cl_bb_tgt=cl_bb_tgt,\n"
             "    snli_bb_a=snli_bb_a, snli_bb_b=snli_bb_b, snli_labels_t=snli_labels_t,\n"
             ")\n"
-            "print(f'\\nFinal curvature c = {manifold.c.item():.4f}')"
+            "_p1_time = _time.time() - _p1_start\n"
+            "print(f'\\nPhase 1 done in {_p1_time/60:.1f} min')\n"
+            "print(f'Final curvature c = {manifold.c.item():.4f}')\n"
+            "if torch.cuda.is_available():\n"
+            "    print(f'GPU 0 peak VRAM: {torch.cuda.max_memory_allocated(0)/1e9:.2f} GB')"
         ),
         cell_md("## 5. Phase 1 Evaluation"),
         cell_code(
@@ -237,12 +262,17 @@ import geoopt
             "    vis_encoder, cifar_dl_test, device=cfg.device, max_images=cfg.max_clip_images,\n"
             ")\n"
             "print(f'Train CLIP: {clip_train.shape}, Test CLIP: {clip_test.shape}')\n\n"
+            "_p2_start = _time.time()\n"
             "history_p2 = train_phase2(\n"
             "    cfg, manifold, encoder, vis_encoder,\n"
             "    clip_train, clip_labels_train,\n"
             "    fine_bb, coarse_bb, fine2coarse_tensor,\n"
             ")\n"
-            "print(f'\\nFinal curvature c = {manifold.c.item():.4f}')"
+            "_p2_time = _time.time() - _p2_start\n"
+            "print(f'\\nPhase 2 done in {_p2_time/60:.1f} min')\n"
+            "print(f'Final curvature c = {manifold.c.item():.4f}')\n"
+            "if torch.cuda.is_available():\n"
+            "    print(f'GPU 0 peak VRAM: {torch.cuda.max_memory_allocated(0)/1e9:.2f} GB')"
         ),
         cell_md("## 7. Phase 2 Evaluation"),
         cell_code(
@@ -321,12 +351,17 @@ import geoopt
             "    'final_curvature': manifold.c.item(),\n"
             "}, final_path)\n"
             "print(f'Saved model: {final_path}')\n"
-            "print(f'\\n=== SUMMARY ===')\n"
+            "_total_time = _time.time() - _run_start\n"
+            "print(f'\\n{\"=\"*50}')\n"
+            "print(f'  TRAINING COMPLETE — {_total_time/60:.1f} min total')\n"
+            "print(f'{\"=\"*50}')\n"
             "print(f'MRR:          {lp_results[\"MRR\"]:.4f}')\n"
             "print(f'Hits@10:      {lp_results[\"Hits@10\"]:.4f}')\n"
             "print(f'Hierarchy:    {hier_results[\"accuracy\"]:.2%}')\n"
             "print(f'Cross-modal:  R@5={xm_results[\"R@5\"]:.4f}')\n"
-            "print(f'Curvature c:  {manifold.c.item():.4f}')"
+            "print(f'Curvature c:  {manifold.c.item():.4f}')\n"
+            "print(f'Phase 1:      {_p1_time/60:.1f} min')\n"
+            "print(f'Phase 2:      {_p2_time/60:.1f} min')"
         ),
     ]
 
