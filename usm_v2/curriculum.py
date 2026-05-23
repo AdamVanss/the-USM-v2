@@ -102,12 +102,17 @@ class CurriculumSampler:
         self.enabled = enabled
         self.total_epochs = total_epochs
         self.full_data_pct = full_data_pct
+        self.n_triples = len(triples)
 
-        self.scored_triples = [
-            (t, score_triple(t, concept_scores))
-            for t in triples
+        scored = [
+            (i, t, score_triple(t, concept_scores))
+            for i, t in enumerate(triples)
         ]
-        self.scored_triples.sort(key=lambda x: x[1])
+        scored.sort(key=lambda x: x[2])
+
+        self._sorted_orig_idx = [i for i, t, s in scored]
+        self._sorted_scores = [s for i, t, s in scored]
+        self.scored_triples = [(t, s) for i, t, s in scored]
 
     def get_epoch_triples(self, epoch: int) -> List[Tuple[str, str, str]]:
         if not self.enabled:
@@ -120,6 +125,24 @@ class CurriculumSampler:
             result = [t for t, _ in self.scored_triples[:max(100, len(self.scored_triples) // 10)]]
 
         return result
+
+    def get_epoch_indices(self, epoch: int) -> torch.Tensor:
+        """Return original triple indices for this epoch as a LongTensor."""
+        if not self.enabled:
+            return torch.arange(self.n_triples, dtype=torch.long)
+
+        threshold = min(1.0, (epoch + 1) / max(self.total_epochs * self.full_data_pct, 1))
+        selected = [
+            self._sorted_orig_idx[i]
+            for i, s in enumerate(self._sorted_scores)
+            if s <= threshold
+        ]
+
+        min_count = max(100, self.n_triples // 10)
+        if len(selected) < min_count:
+            selected = self._sorted_orig_idx[:min_count]
+
+        return torch.tensor(selected, dtype=torch.long)
 
     def get_progress(self, epoch: int) -> float:
         """Returns curriculum progress in [0, 1]."""
@@ -209,3 +232,35 @@ def sample_negatives(
         hard_negs = random.choices(vocab_list, k=n_hard)
 
     return easy_negs + hard_negs
+
+
+def sample_negatives_gpu(
+    batch_size: int,
+    n_vocab: int,
+    epoch: int,
+    total_epochs: int,
+    device: torch.device,
+    all_z: Optional[torch.Tensor] = None,
+    z_pred: Optional[torch.Tensor] = None,
+    t_idx: Optional[torch.Tensor] = None,
+    hard_neg_max_ratio: float = 0.8,
+) -> torch.Tensor:
+    """
+    GPU-native negative sampling — returns vocab index tensor directly.
+
+    No string operations, no CPU round-trips.
+    """
+    hard_ratio = min(hard_neg_max_ratio, epoch / max(total_epochs * 0.6, 1))
+    n_hard = int(batch_size * hard_ratio)
+    n_easy = batch_size - n_hard
+
+    neg_idx = torch.randint(0, n_vocab, (batch_size,), device=device)
+
+    if n_hard > 0 and all_z is not None and z_pred is not None:
+        with torch.no_grad():
+            dists = torch.cdist(z_pred[:n_hard].float(), all_z.float(), p=2)
+            if t_idx is not None:
+                dists[torch.arange(n_hard, device=device), t_idx[:n_hard]] = float("inf")
+            neg_idx[:n_hard] = dists.argmin(dim=-1)
+
+    return neg_idx

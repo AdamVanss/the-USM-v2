@@ -14,7 +14,6 @@ The epoch loop is structured as:
 """
 
 import os
-import random
 import time
 import math
 
@@ -41,10 +40,9 @@ from .curriculum import (
     compute_difficulty_scores,
     CurriculumSampler,
     LossWeightScheduler,
-    sample_negatives,
+    sample_negatives_gpu,
 )
 from .data import (
-    KGDataset, kg_collate_fn,
     CIFAR100_FINE, CIFAR100_COARSE, CIFAR100_FINE2COARSE,
 )
 
@@ -98,8 +96,6 @@ def train_phase1(
     vocab_list: List[str],
     vocab_bb: torch.Tensor,
     concept2bb: Dict[str, int],
-    # Pre-cached backbone tensors — if provided, encode_backbone is never called
-    # inside the batch loop (huge speedup on T4 and similar GPUs)
     cl_bb_src: Optional[torch.Tensor] = None,
     cl_bb_tgt: Optional[torch.Tensor] = None,
     snli_bb_a: Optional[torch.Tensor] = None,
@@ -107,13 +103,10 @@ def train_phase1(
     snli_labels_t: Optional[torch.Tensor] = None,
 ) -> Dict[str, List]:
     """
-    Phase 1 training loop with all three enhancements:
-      - Learnable curvature (burn-in → full)
-      - Riemannian gradient control (scaling + clipping)
-      - Curriculum (progressive data, loss scheduling, hard negatives)
+    Phase 1 — GPU-native training loop.
 
-    Pass pre-cached backbone tensors (cl_bb_src/tgt, snli_bb_a/b, snli_labels_t)
-    to avoid running the backbone encoder inside the hot batch loop.
+    All triple data is pre-converted to integer index tensors on GPU.
+    No string operations, dict lookups, or CPU-side DataLoader in the hot loop.
     """
     device = cfg.device
     history = {
@@ -121,6 +114,12 @@ def train_phase1(
         "loss_cl": [], "loss_ent": [], "loss_hier": [],
         "curvature": [], "lr": [], "curriculum_pct": [],
     }
+
+    # ---- Pre-convert ALL triples to GPU index tensors (once) ----
+    all_h_idx = torch.tensor([concept2bb[h] for h, r, t in triples], device=device)
+    all_r_idx = torch.tensor([REL2IDX[r] for h, r, t in triples], device=device)
+    all_t_idx = torch.tensor([concept2bb[t] for h, r, t in triples], device=device)
+    n_vocab = len(vocab_list)
 
     difficulty_scores = compute_difficulty_scores(triples, vocab_list)
     curriculum = CurriculumSampler(
@@ -130,6 +129,9 @@ def train_phase1(
     )
     loss_scheduler = LossWeightScheduler(cfg.n_epochs_p1, enabled=cfg.curriculum_enabled)
     burnin = BurninScheduler(cfg.burnin_epochs, cfg.transition_epochs)
+
+    n_cl = cl_bb_src.shape[0] if cl_bb_src is not None else 0
+    n_snli = snli_bb_a.shape[0] if snli_bb_a is not None else 0
 
     manifold_ids = {id(p) for p in manifold.parameters()}
     manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
@@ -147,9 +149,7 @@ def train_phase1(
             seen.add(pid)
             model_params.append(p)
 
-    param_groups = [
-        {"params": model_params, "lr": cfg.lr_p1},
-    ]
+    param_groups = [{"params": model_params, "lr": cfg.lr_p1}]
     if manifold_params:
         param_groups.append({"params": manifold_params, "lr": cfg.c_lr})
 
@@ -160,15 +160,13 @@ def train_phase1(
         "L_cl": cfg.w_cl, "L_ent": cfg.w_ent, "L_hier": cfg.w_hier,
     }
 
-    vocab2idx = {c: i for i, c in enumerate(vocab_list)}
-
-    e0_triples = curriculum.get_epoch_triples(0)
-    e0_batches = len(e0_triples) // cfg.batch_size
+    e0_idx = curriculum.get_epoch_indices(0)
+    e0_batches = len(e0_idx) // cfg.batch_size
     print(
         f'Phase 1 starting: {cfg.n_epochs_p1} epochs | {len(triples):,} triples | '
         f'batch={cfg.batch_size} | d={cfg.d} | device={device}\n'
-        f'  Epoch 0: {len(e0_triples):,} triples (~{e0_batches} batches) — '
-        f'first summary line appears after epoch 0 finishes',
+        f'  Epoch 0: {len(e0_idx):,} triples (~{e0_batches} batches)\n'
+        f'  GPU-native loop: no CPU string ops in hot path',
         flush=True,
     )
 
@@ -181,15 +179,16 @@ def train_phase1(
         c_scale = burnin.get_curvature_scale(epoch)
         c_eff = manifold.effective_c(c_scale)
 
-        epoch_triples = curriculum.get_epoch_triples(epoch)
+        epoch_idx = curriculum.get_epoch_indices(epoch).to(device)
+        n_epoch = len(epoch_idx)
         weights = loss_scheduler.get_weights(epoch, base_weights)
         cpct = curriculum.get_progress(epoch)
 
-        kg_ds = KGDataset(epoch_triples)
-        kg_dl = DataLoader(
-            kg_ds, batch_size=cfg.batch_size, shuffle=True,
-            collate_fn=kg_collate_fn, drop_last=True,
-        )
+        # Shuffle this epoch's triples on GPU
+        perm = torch.randperm(n_epoch, device=device)
+        ep_h = all_h_idx[epoch_idx[perm]]
+        ep_r = all_r_idx[epoch_idx[perm]]
+        ep_t = all_t_idx[epoch_idx[perm]]
 
         all_z = (
             encoder.project(vocab_bb, c=c_eff).detach()
@@ -199,31 +198,32 @@ def train_phase1(
         epoch_loss = 0.0
         epoch_losses = {k: 0.0 for k in history if k.startswith("loss_")}
         n_batches = 0
+        BS = cfg.batch_size
+        n_total_batches = n_epoch // BS
 
         batch_iter = tqdm(
-            kg_dl,
+            range(0, n_epoch - BS + 1, BS),
             desc=f'P1 E{epoch:02d}',
+            total=n_total_batches,
             leave=(epoch == cfg.n_epochs_p1 - 1),
         )
-        for heads, rels, tails in batch_iter:
-            h_idx = torch.tensor([concept2bb[h] for h in heads], device=device)
-            t_idx = torch.tensor([concept2bb[t] for t in tails], device=device)
+        for start in batch_iter:
+            h_idx = ep_h[start:start + BS]
+            t_idx = ep_t[start:start + BS]
+            rels = ep_r[start:start + BS]
 
             z_h = encoder.project(vocab_bb[h_idx], c=c_eff)
             z_t = encoder.project(vocab_bb[t_idx], c=c_eff)
-            rels = rels.to(device)
 
             z_pred = rel_maps(z_h, rels, c=c_eff)
 
-            neg_tails = sample_negatives(
-                z_h.shape[0], vocab_list, epoch, cfg.n_epochs_p1,
+            neg_idx = sample_negatives_gpu(
+                BS, n_vocab, epoch, cfg.n_epochs_p1, device,
                 all_z=all_z,
                 z_pred=z_pred.detach() if epoch > 5 else None,
-                vocab2idx=vocab2idx,
-                exclude_idx=[vocab2idx.get(t) for t in tails],
+                t_idx=t_idx,
                 hard_neg_max_ratio=cfg.hard_neg_max_ratio,
             )
-            neg_idx = torch.tensor([concept2bb[n] for n in neg_tails], device=device)
             z_neg = encoder.project(vocab_bb[neg_idx], c=c_eff)
 
             L_rel_val = loss_rel(z_pred, z_t, z_neg, c_eff, margin=cfg.margin_rel)
@@ -235,40 +235,22 @@ def train_phase1(
                 L_comp_val = z_comp.pow(2).mean()
 
             L_cl_val = z_h.new_zeros(())
-            if cl_pairs and weights.get("L_cl", 0) > 0:
-                n_cl = min(cfg.batch_size // 2, len(cl_pairs))
-                if cl_bb_src is not None and cl_bb_tgt is not None:
-                    idx_cl = torch.randint(0, cl_bb_src.shape[0], (n_cl,))
-                    src_bb = cl_bb_src[idx_cl]
-                    tgt_bb = cl_bb_tgt[idx_cl]
-                else:
-                    cl_batch = random.sample(cl_pairs, n_cl)
-                    src_texts, tgt_texts = zip(*cl_batch)
-                    src_bb = encoder.encode_backbone(list(src_texts))
-                    tgt_bb = encoder.encode_backbone(list(tgt_texts))
-                z_src = encoder.project(src_bb, c=c_eff)
-                z_tgt = encoder.project(tgt_bb, c=c_eff)
+            if n_cl > 0 and weights.get("L_cl", 0) > 0:
+                n_cl_batch = min(BS // 2, n_cl)
+                idx_cl = torch.randint(0, n_cl, (n_cl_batch,), device=device)
+                z_src = encoder.project(cl_bb_src[idx_cl], c=c_eff)
+                z_tgt = encoder.project(cl_bb_tgt[idx_cl], c=c_eff)
                 L_cl_val = loss_cl(z_src, z_tgt, c_eff)
 
             L_ent_val = z_h.new_zeros(())
-            if snli_pairs and weights.get("L_ent", 0) > 0:
-                n_ent = min(cfg.batch_size // 2, len(snli_pairs))
-                if snli_bb_a is not None and snli_bb_b is not None and snli_labels_t is not None:
-                    idx_sn = torch.randint(0, snli_bb_a.shape[0], (n_ent,))
-                    za_bb = snli_bb_a[idx_sn]
-                    zb_bb = snli_bb_b[idx_sn]
-                    sn_labels = snli_labels_t[idx_sn].to(device)
-                else:
-                    ent_batch = random.sample(snli_pairs, n_ent)
-                    sa, sb, slabels = zip(*ent_batch)
-                    za_bb = encoder.encode_backbone(list(sa))
-                    zb_bb = encoder.encode_backbone(list(sb))
-                    sn_labels = torch.tensor(slabels, device=device)
-                z_a_ent = encoder.project(za_bb, c=c_eff)
-                z_b_ent = encoder.project(zb_bb, c=c_eff)
+            if n_snli > 0 and weights.get("L_ent", 0) > 0:
+                n_ent_batch = min(BS // 2, n_snli)
+                idx_sn = torch.randint(0, n_snli, (n_ent_batch,), device=device)
+                z_a_ent = encoder.project(snli_bb_a[idx_sn], c=c_eff)
+                z_b_ent = encoder.project(snli_bb_b[idx_sn], c=c_eff)
                 L_ent_val = loss_entailment(
                     z_a_ent, z_b_ent,
-                    sn_labels,
+                    snli_labels_t[idx_sn],
                     c_eff, delta_c=cfg.delta_contradiction,
                 )
 
@@ -320,7 +302,7 @@ def train_phase1(
             f"[P1 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
             f"c_eff={c_eff.item():.4f}  "
-            f"data={len(epoch_triples):,}/{len(triples):,}  "
+            f"data={n_epoch:,}/{len(triples):,}  "
             f"curriculum={cpct:.0%}  "
             f"({dt:.1f}s)",
             flush=True,
