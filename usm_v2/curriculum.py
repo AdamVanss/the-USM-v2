@@ -41,27 +41,35 @@ def compute_difficulty_scores(
             parents[h].add(t)
 
     roots = set()
-    for concept in set(children.keys()) | set(parents.keys()):
+    all_nodes = set(children.keys()) | set(parents.keys())
+    for concept in all_nodes:
         if concept not in parents:
             roots.add(concept)
 
+    if not roots:
+        roots = all_nodes
+
     depths: Dict[str, int] = {}
-    queue = list(roots)
+    from collections import deque
+    queue = deque(roots)
     for r in roots:
         depths[r] = 0
 
+    MAX_DEPTH = 50
     while queue:
-        node = queue.pop(0)
+        node = queue.popleft()
         d = depths[node]
+        if d >= MAX_DEPTH:
+            continue
         for child in children.get(node, []):
-            if child not in depths or depths[child] < d + 1:
+            if child not in depths:
                 depths[child] = d + 1
                 queue.append(child)
 
     if not depths:
         return {c: 0.5 for c in vocab_list}
 
-    max_depth = max(depths.values()) if depths else 1
+    max_depth = max(depths.values(), default=1)
     max_depth = max(max_depth, 1)
 
     scores = {}
