@@ -125,6 +125,7 @@ class USMConfig:
         self.n_epochs_p1 = 50
         self.n_epochs_p2 = 40
         self.batch_size = 512
+        self.lr_p1 = 3e-4
         self.p2_batch = 2048
         self.max_cn_triples = 300_000
         self.max_cl_per_lang = 30_000
