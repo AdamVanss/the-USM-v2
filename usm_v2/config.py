@@ -13,13 +13,15 @@ from typing import Optional
 class USMConfig:
     seed: int = 42
 
-    # --- Manifold ---
+    # --- Manifold (per-relation scheduled curvature) ---
     c_init: float = 0.001
     c_min: float = 0.0001
     c_max: float = 10.0
-    c_lr: float = 1e-4
-    c_freeze_epochs: int = 10
-    learnable_curvature: bool = True
+    # Per-relation targets: IS_A, CAUSES, PART_OF, SIMILAR_TO, ANTONYM, CAPABLE_OF
+    c_targets: tuple = (0.05, 0.01, 0.03, 0.003, 0.003, 0.01)
+    c_warmup_start: int = 10
+    c_warmup_end: int = 40
+    learnable_curvature: bool = False
 
     # --- Dimensions ---
     d: int = 1024

@@ -133,16 +133,18 @@ def train_phase1(
     n_cl = cl_bb_src.shape[0] if cl_bb_src is not None else 0
     n_snli = snli_bb_a.shape[0] if snli_bb_a is not None else 0
 
-    # Freeze curvature for first N epochs so projection learns the hyperbolic layout
-    c_freeze = getattr(cfg, 'c_freeze_epochs', 10)
-    if cfg.learnable_curvature and c_freeze > 0:
-        manifold._c_params.requires_grad_(False)
+    # Curvature is scheduled, not learned — prevents optimizer collapse
+    manifold._c_params.requires_grad_(False)
+    c_targets = torch.tensor(
+        cfg.c_targets[:N_RELATIONS] if hasattr(cfg, 'c_targets') else [cfg.c_init] * N_RELATIONS,
+        device=device, dtype=torch.float32,
+    )
+    c_ws = getattr(cfg, 'c_warmup_start', 10)
+    c_we = getattr(cfg, 'c_warmup_end', 40)
 
     manifold_ids = {id(p) for p in manifold.parameters()}
-    manifold_params = [p for p in manifold.parameters() if p.requires_grad] if cfg.learnable_curvature else []
-
     model_params = []
-    seen = set(id(p) for p in manifold_params) | manifold_ids
+    seen = set(manifold_ids)
     for p in (
         list(encoder.proj.parameters())
         + ([encoder.mu0] if hasattr(encoder, "mu0") else [])
@@ -154,11 +156,10 @@ def train_phase1(
             seen.add(pid)
             model_params.append(p)
 
-    param_groups = [{"params": model_params, "lr": cfg.lr_p1}]
-    if manifold_params:
-        param_groups.append({"params": manifold_params, "lr": cfg.c_lr})
-
-    optimizer = geoopt.optim.RiemannianAdam(param_groups, weight_decay=cfg.weight_decay)
+    optimizer = geoopt.optim.RiemannianAdam(
+        [{"params": model_params, "lr": cfg.lr_p1}],
+        weight_decay=cfg.weight_decay,
+    )
 
     base_weights = {
         "L_rel": cfg.w_rel, "L_comp": cfg.w_comp,
@@ -170,14 +171,14 @@ def train_phase1(
 
     e0_idx = curriculum.get_epoch_indices(0)
     e0_batches = len(e0_idx) // cfg.batch_size
-    c_per_rel_str = " ".join(f"{manifold.c_rel(r).item():.4f}" for r in range(N_RELATIONS))
+    tgt_str = " ".join(f"{v:.4f}" for v in c_targets.tolist())
     print(
         f'Phase 1 starting: {cfg.n_epochs_p1} epochs | {len(triples):,} triples | '
         f'batch={cfg.batch_size} | d={cfg.d} | device={device}\n'
-        f'  Per-relation curvature: [{c_per_rel_str}]\n'
-        f'  Relations: {" ".join(RELATIONS)}\n'
+        f'  Curvature targets: [{tgt_str}]\n'
+        f'  Relations:         {" ".join(RELATIONS)}\n'
+        f'  Warmup: E{c_ws}→E{c_we} (linear ramp per relation)\n'
         f'  Epoch 0: {len(e0_idx):,} triples (~{e0_batches} batches)\n'
-        f'  Curvature frozen for first {c_freeze} epochs, then learnable\n'
         f'  GPU-native loop + cosine LR schedule',
         flush=True,
     )
@@ -188,14 +189,17 @@ def train_phase1(
         comp_op.train()
         rel_maps.train()
 
-        # Unfreeze per-relation curvature after warm-up
-        if epoch == c_freeze and cfg.learnable_curvature:
-            manifold._c_params.requires_grad_(True)
-            optimizer.add_param_group({"params": [manifold._c_params], "lr": cfg.c_lr})
-            c_str = " ".join(f"{manifold.c_rel(r).item():.4f}" for r in range(N_RELATIONS))
-            print(f'  [E{epoch:02d}] Curvature unfrozen: [{c_str}]', flush=True)
+        # Scheduled curvature warmup: linear ramp from c_init to c_targets
+        with torch.no_grad():
+            if epoch < c_ws:
+                progress = 0.0
+            elif epoch >= c_we:
+                progress = 1.0
+            else:
+                progress = (epoch - c_ws) / max(c_we - c_ws, 1)
+            manifold._c_params.copy_(cfg.c_init + (c_targets - cfg.c_init) * progress)
 
-        # Cosine LR schedule for model params (not manifold params)
+        # Cosine LR schedule
         cos_lr = cfg.lr_p1 * 0.5 * (1 + math.cos(math.pi * epoch / cfg.n_epochs_p1))
         optimizer.param_groups[0]["lr"] = cos_lr
 
@@ -212,8 +216,7 @@ def train_phase1(
         ep_r = all_r_idx[epoch_idx[perm]]
         ep_t = all_t_idx[epoch_idx[perm]]
 
-        with torch.no_grad():
-            c_base_detached = manifold.effective_c(c_scale).detach()
+        c_base_detached = manifold.c.detach()
         all_z = (
             encoder.project(vocab_bb, c=c_base_detached).detach()
             if epoch > 5 else None
@@ -344,15 +347,14 @@ def train_phase1(
         history["loss_cl"].append(epoch_losses["loss_cl"] / nb)
         history["loss_ent"].append(epoch_losses["loss_ent"] / nb)
         history["loss_hier"].append(epoch_losses["loss_hier"] / nb)
-        history["curvature"].append(c_base_detached.item())
-        with torch.no_grad():
-            c_per_rel = [manifold.c_rel(r).item() for r in range(N_RELATIONS)]
+        c_per_rel = [manifold.c_rel(r).item() for r in range(N_RELATIONS)]
+        history["curvature"].append(max(c_per_rel))
         history["curvature_per_rel"].append(c_per_rel)
-        history["lr"].append(optimizer.param_groups[0]["lr"])
+        history["lr"].append(cos_lr)
         history["curriculum_pct"].append(cpct)
 
         dt = time.time() - t0
-        c_rel_str = " ".join(f"{v:.4f}" for v in c_per_rel)
+        c_rel_str = " ".join(f"{v:.3f}" for v in c_per_rel)
         print(
             f"[P1 E{epoch:02d}] "
             f"loss={epoch_loss / nb:.4f}  "
