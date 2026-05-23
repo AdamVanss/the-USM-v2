@@ -77,6 +77,11 @@ class USMConfig:
     ckpt_every: int = 5
     encode_batch: int = 512
     grad_accum: int = 2
+    max_clip_images: int = 50_000
+
+    # --- Run mode ---
+    # True = fast Colab smoke test (~5–10 min). False = training scale.
+    validation_mode: bool = False
 
     # --- Computed at runtime ---
     device: Optional[torch.device] = field(default=None, repr=False)
@@ -95,7 +100,9 @@ class USMConfig:
             self.large_gpu = False
             self.use_bf16 = False
 
-        if not self.large_gpu:
+        if self.validation_mode:
+            self.apply_validation_scale()
+        elif not self.large_gpu:
             self._apply_medium_scale()
 
     def _apply_medium_scale(self):
@@ -108,4 +115,24 @@ class USMConfig:
         self.batch_size = 128
         self.max_cn_triples = 100_000
         self.encode_batch = 256
+        self.grad_accum = 1
+
+    def apply_validation_scale(self):
+        """Fast smoke test: verify pipeline, not benchmark quality (~5–10 min on T4)."""
+        self.d = 256
+        self.d_clip = 256
+        self.clip_model = "openai/clip-vit-base-patch32"
+        self.n_epochs_p1 = 3
+        self.n_epochs_p2 = 2
+        self.batch_size = 64
+        self.p2_batch = 256
+        self.max_cn_triples = 3_000
+        self.max_cl_per_lang = 300
+        self.max_snli_pairs = 300
+        self.max_clip_images = 4_000
+        self.encode_batch = 128
+        self.burnin_epochs = 2
+        self.transition_epochs = 1
+        self.curriculum_enabled = False
+        self.ckpt_every = 999
         self.grad_accum = 1
